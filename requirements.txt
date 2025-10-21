@@ -33,7 +33,7 @@ fastapi==0.103.2
 ffmpy==0.4.0
 filelock==3.15.4
 flake8==7.1.1
-flash-attn==2.6.3
+flash-attn==2.3.6
 fonttools==4.53.1
 frozendict==2.4.4
 frozenlist==1.4.1
@@ -58,6 +58,7 @@ jsonschema==4.23.0
 jsonschema-specifications==2023.12.1
 kiwisolver==1.4.5
 latex2mathml==3.77.0
+latex2sympy2
 libcst==1.1.0
 linkify-it-py==2.0.3
 lit==18.1.8
@@ -122,7 +123,7 @@ psutil==6.0.0
 py-cpuinfo==9.0.0
 pyarrow==17.0.0
 pycodestyle==2.12.1
-pydantic==1.10.18
+pydantic==1.10.13
 pydub==0.25.1
 pyflakes==3.2.0
 Pygments==2.18.0
@@ -142,6 +143,8 @@ rpds-py==0.20.0
 safetensors==0.4.4
 scikit-learn==1.2.2
 scipy==1.14.1
+sentence-transformers==2.2.2
+validators==0.35.0
 semantic-version==2.10.0
 sentencepiece==0.1.99
 sentry-sdk==2.13.0
@@ -176,8 +179,8 @@ tzdata==2024.1
 uc-micro-py==1.0.3
 urllib3==2.2.2
 uvicorn==0.30.6
-validators==0.34.0
 vector-quantize-pytorch==1.17.1
+vllm==0.2.2
 wandb==0.17.7
 wavedrom==2.0.3.post3
 websockets==13.0

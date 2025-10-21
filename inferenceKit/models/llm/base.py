@@ -5,10 +5,18 @@ import torch
 from torch import nn
 from transformers.generation import GenerationConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm import LLM, SamplingParams
 
 from ..prm import BaseProcessRewardModel
 from inferenceKit.utils import update_single_config, update_sampling_params_from_generation_config
+
+# Conditional vllm import
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+    LLM = None
+    SamplingParams = None
 
 class BaseLargeLanguageModel(nn.Module):
     def __init__(self, model_path, **kwargs):
@@ -39,10 +47,23 @@ class BaseLargeLanguageModel(nn.Module):
                 attn_implementation="flash_attention_2" if self.config.flash_attn else None,
                 )
             tokenizer = AutoTokenizer.from_pretrained(model_path)
+            
+            # Ensure tokenizer has proper pad token
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
         return model, tokenizer
 
     def _default_config(self, base_config=None):
         config = base_config or GenerationConfig()
+        
+        # Ensure proper configuration for LLaMA models
+        if not hasattr(config, 'pad_token_id') or config.pad_token_id is None:
+            config.pad_token_id = 0  # Default pad token for LLaMA
+        
+        if not hasattr(config, 'eos_token_id') or config.eos_token_id is None:
+            config.eos_token_id = 2  # Default EOS token for LLaMA
+            
         return config
 
     @torch.inference_mode()
@@ -70,6 +91,8 @@ class DefaultLargeLanguageModel(BaseLargeLanguageModel):
 
 class VLLMLargeLanguageModel(BaseLargeLanguageModel):
     def __init__(self, model_path, **kwargs):
+        if not VLLM_AVAILABLE:
+            raise ImportError("vllm is not available. Please install vllm or use a different model type.")
         super().__init__(model_path, **kwargs)
         
     def _load_model(self, model_path):

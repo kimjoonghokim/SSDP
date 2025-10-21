@@ -8,6 +8,7 @@ from types import MethodType
 import torch
 
 from .base import Searcher, Node
+from .clustering import cluster_parallel_nodes
 from transformers.cache_utils import DynamicCache
 from transformers import StoppingCriteria
 import heapq
@@ -128,6 +129,12 @@ class CoT_DPTS_Searcher(Searcher):
         self.terminated_node = set()  
         self.finished_node = set()
         self.all_nodes = set()
+        self.expanded_nodes = set()  # Track which nodes have been expanded (needed for rollout logic)
+
+        # Simplified node tracking metrics
+        self.total_node_explorations = 0  # Total number of node explorations (including re-explorations)
+        self.total_nodes_pruned = 0       # Nodes removed by clustering
+        self.clustering_applied_count = 0
 
         self.max_parallel_num = inference_config.llm_config.num_beams
         self.init_memory_ratio = getMemoryUsage()
@@ -136,6 +143,20 @@ class CoT_DPTS_Searcher(Searcher):
         cur_node = self._get_root_node(inputs)
         best_action = self._search(cur_node)
         return self.finalize()
+    
+    def get_clustering_metrics(self):
+        """Get simplified clustering metrics"""
+        total_terminated_nodes = len(self.terminated_node)
+        total_all_nodes = len(self.all_nodes)
+        
+        return {
+            "total_node_explorations": self.total_node_explorations,
+            "total_nodes_pruned": self.total_nodes_pruned,
+            "total_terminated_nodes": total_terminated_nodes,
+            "total_all_nodes": total_all_nodes,
+            "clustering_applied_count": self.clustering_applied_count,
+            "nodes_saved_by_clustering": self.total_nodes_pruned if self.clustering_applied_count > 0 else 0
+        }
     
     def finalize(self):
         
@@ -222,7 +243,7 @@ class CoT_DPTS_Searcher(Searcher):
             total_time += end_time - start_time
             rollouts += 1
         
-        return max(node.children, key=self._select_best_action)
+        return max(node.children, key=self._select_best_action) if node.children else node
     
     def _get_best_path(self):
         if len(self.terminated_node) == 0:
@@ -376,11 +397,17 @@ class CoT_DPTS_Searcher(Searcher):
     def _expand(self, node):
         if isinstance(node, SeqNode): 
             self.nodes.add(node)
+            # Track that this node has been expanded (needed for rollout logic)
             self.expanded_nodes.add(node)
+            # Count every exploration (including re-explorations)
+            self.total_node_explorations += 1
         else:
             for t_node in node: 
                 self.nodes.add(t_node)
+                # Track that this node has been expanded (needed for rollout logic)
                 self.expanded_nodes.add(t_node)
+                # Count every exploration (including re-explorations)
+                self.total_node_explorations += 1
                
         children_nodes = self.expand_fn(node)
         if isinstance(node, SeqNode): 
@@ -414,7 +441,7 @@ class CoT_DPTS_Searcher(Searcher):
             self.finished_node.add(node)
         return res
 
-def _get_seq_length(self):
+def _get_seq_length(self, layer_idx=0):
     return self.seen_seq_len
 
 def get_past_kv(node, beam_size) -> DynamicCache:
@@ -476,13 +503,41 @@ def prepare_inputs_for_inference(node, tree_width, generation_config):
 
     padded_tensors = []
     masks = []
+    # Use a default pad_token_id if None
+    pad_token_id = generation_config.pad_token_id if generation_config.pad_token_id is not None else 0
+    
     for tensor in inputs:
+        # Ensure tensor is properly formatted
+        if not isinstance(tensor, torch.Tensor):
+            tensor = torch.tensor(tensor, device=tensor.device if hasattr(tensor, 'device') else 'cuda:0')
+        
+        # Ensure tensor has the right dtype for token IDs
+        if tensor.dtype != torch.long:
+            tensor = tensor.long()
+        
+        # Clamp token IDs to valid range to prevent CUDA errors
+        vocab_size = 128256  # LLaMA vocab size
+        tensor = torch.clamp(tensor, 0, vocab_size - 1)
+        
         padding = torch.zeros([1, max_input_len - tensor.shape[-1]], dtype=tensor.dtype, device=tensor.device) 
-        padded_tensors.append(torch.cat([padding + generation_config.pad_token_id, tensor], dim=-1))
-        masks.append(torch.cat([padding, torch.ones_like(tensor, dtype=tensor.dtype, device=tensor.device)], dim=-1))
+        padded_tensors.append(torch.cat([padding + pad_token_id, tensor], dim=-1))
+        # Create proper attention mask: 0 for padding, 1 for real tokens
+        mask_padding = torch.zeros([1, max_input_len - tensor.shape[-1]], dtype=torch.bool, device=tensor.device)
+        mask_tokens = torch.ones([1, tensor.shape[-1]], dtype=torch.bool, device=tensor.device)
+        masks.append(torch.cat([mask_padding, mask_tokens], dim=-1))
 
     parallel_input = torch.cat(padded_tensors, dim=0)
     mask = torch.cat(masks, dim=0)
+    
+    # Ensure mask is properly formatted for attention
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+    
+    # Ensure mask has the right shape
+    if mask.shape != parallel_input.shape:
+        print(f"WARNING: Mask shape {mask.shape} doesn't match input shape {parallel_input.shape}")
+        # Create a proper mask if shapes don't match
+        mask = torch.ones_like(parallel_input, dtype=torch.bool)
     
     parallel_past_key_values = DynamicCache()
     for layer_idx in range(len(past_key_values.key_cache[0])):
@@ -508,7 +563,7 @@ def prepare_inputs_for_inference(node, tree_width, generation_config):
     
     return parallel_input, parallel_past_key_values, mask, input_len, max_input_len, kv_len, max_kv_len 
         
-def expand(node, generate_fn, reward_fn, inference_config) -> Set[SeqNode]:
+def expand(node, generate_fn, reward_fn, inference_config, embedding_model=None, tokenizer=None, searcher=None) -> Set[SeqNode]:
 
     generation_config = inference_config.llm_config
     tree_width = inference_config.config.tree_width 
@@ -531,18 +586,83 @@ def expand(node, generate_fn, reward_fn, inference_config) -> Set[SeqNode]:
         for i, (ids, sc) in enumerate(zip(output_ids.unbind(0), scores.unbind(0))):  
             not_pad_token = (ids != generation_config.pad_token_id)
             out = ids[not_pad_token]
-            n = SeqNode(seq=out.unsqueeze(0), len=out.shape[-1]-input_len, parent=node)
+            # Ensure out is a proper tensor
+            if not isinstance(out, torch.Tensor):
+                out = torch.tensor(out, device=ids.device)
+            elif out.dim() == 0:
+                out = out.unsqueeze(0)
+            
+            # Create the sequence tensor properly
+            seq_tensor = out.unsqueeze(0) if out.dim() == 1 else out
+            n = SeqNode(seq=seq_tensor, len=out.shape[-1]-input_len, parent=node)
 
-            kv_len = sum(not_pad_token) - 1
+            # Fix: Handle both tensor and scalar cases
+            if hasattr(not_pad_token, 'sum'):
+                kv_len = not_pad_token.sum().item() - 1
+            else:
+                kv_len = 1 if not_pad_token else 0
             n.update_kv(past_key_values, n_seq_len=n.len, subtree_idx=i, kv_len=kv_len) 
 
             reward_score = reward_fn(n)
             n.reward_score = reward_score[0][-1] if len(reward_score[0]) > 0 else 0.2
+            print(f"[SCORING DEBUG] Node {n.id} scored: {n.reward_score:.4f}")
             new_nodes.add(n)
+
+        # Track clustering metrics if searcher is available
+        nodes_before_clustering = len(new_nodes)
+        
+        # Apply clustering if embedding model is provided and clustering is enabled
+        if (embedding_model is not None and 
+            hasattr(inference_config.config, 'enable_clustering') and 
+            inference_config.config.enable_clustering and 
+            len(new_nodes) > 1):
+            
+            print(f"[EXPANSION DEBUG] Applying clustering to {nodes_before_clustering} nodes")
+            
+            # Get clustering parameters
+            threshold = getattr(inference_config.config, 'clustering_threshold', 0.8)
+            method = getattr(inference_config.config, 'clustering_method', 'cosine_similarity')
+            enable_similarity_vote = getattr(inference_config.config, 'enable_similarity_vote', False)
+            similarity_vote_weight = getattr(inference_config.config, 'similarity_vote_weight', 0.0)
+            
+            print(f"[EXPANSION DEBUG] Clustering config: threshold={threshold}, method={method}")
+            print(f"[EXPANSION DEBUG] Similarity voting: enabled={enable_similarity_vote}, weight={similarity_vote_weight}")
+            
+            # Show nodes before clustering
+            print(f"[EXPANSION DEBUG] Nodes before clustering: {[(n.id, getattr(n, 'reward_score', 'N/A')) for n in new_nodes]}")
+            
+            # Apply clustering
+            new_nodes = cluster_parallel_nodes(new_nodes, embedding_model, threshold, method, tokenizer,
+                                             enable_similarity_vote, similarity_vote_weight)
+            
+            nodes_after_clustering = len(new_nodes)
+            nodes_pruned = nodes_before_clustering - nodes_after_clustering
+            
+            # Track clustering-specific metrics
+            if searcher is not None:
+                searcher.total_nodes_pruned += nodes_pruned
+                searcher.clustering_applied_count += 1
+                print(f"[CLUSTERING DEBUG] Applied clustering: pruned {nodes_pruned} nodes, total pruned: {searcher.total_nodes_pruned}, total applied: {searcher.clustering_applied_count}")
+            
+            print(f"[EXPANSION DEBUG] Nodes after clustering: {[(n.id, getattr(n, 'reward_score', 'N/A')) for n in new_nodes]}")
+            print(f"[CLUSTERING METRICS] Pruned {nodes_pruned} nodes ({nodes_before_clustering} → {nodes_after_clustering})")
+        else:
+            # No clustering applied - all nodes are kept
+            if searcher is not None:
+                searcher.total_nodes_pruned += 0  # No nodes pruned when clustering is disabled
+                print(f"[CLUSTERING DEBUG] No clustering applied: total pruned: {searcher.total_nodes_pruned}, total applied: {searcher.clustering_applied_count}")
+            
+            # Check if clustering was supposed to be enabled but couldn't be applied
+            if (embedding_model is not None and 
+                hasattr(inference_config.config, 'enable_clustering') and 
+                inference_config.config.enable_clustering):
+                print(f"[EXPANSION DEBUG] Clustering enabled but only {len(new_nodes)} node(s), skipping clustering")
+            else:
+                print(f"[EXPANSION DEBUG] Clustering disabled or no embedding model, using {len(new_nodes)} nodes as-is")
 
         return new_nodes
 
-    else: 
+    else:
         
         ordered_nodes = list(node)
         parallel_input, parallel_past_key_values, mask, input_len, max_input_len, kv_len, max_kv_len = \
@@ -552,7 +672,7 @@ def expand(node, generate_fn, reward_fn, inference_config) -> Set[SeqNode]:
             parallel_past_key_values.seen_seq_len = max_input_len - 1
             parallel_past_key_values.get_seq_length = MethodType(_get_seq_length, parallel_past_key_values)
             
-        output_dict = generate_fn(parallel_input, past_key_values=parallel_past_key_values)
+        output_dict = generate_fn(parallel_input, attention_mask=mask, past_key_values=parallel_past_key_values)
       
         past_key_values = output_dict.past_key_values
         assert isinstance(past_key_values, DynamicCache)
@@ -566,9 +686,22 @@ def expand(node, generate_fn, reward_fn, inference_config) -> Set[SeqNode]:
         for i, (ids, sc) in enumerate(zip(output_ids.unbind(0), scores.unbind(0))): 
             not_pad_token = (ids != generation_config.pad_token_id)
             out = ids[not_pad_token]
-            n = SeqNode(seq=out.unsqueeze(0), len=out.shape[-1] - input_len[i//tree_width], parent=ordered_nodes[i//tree_width])
+            
+            # Ensure out is a proper tensor before creating SeqNode
+            if not isinstance(out, torch.Tensor):
+                out = torch.tensor(out, device=ids.device)
+            elif out.dim() == 0:
+                out = out.unsqueeze(0)
+            
+            # Create the sequence tensor properly
+            seq_tensor = out.unsqueeze(0) if out.dim() == 1 else out
+            n = SeqNode(seq=seq_tensor, len=out.shape[-1] - input_len[i//tree_width], parent=ordered_nodes[i//tree_width])
 
-            kv_len = sum(not_pad_token) - 1
+            # Fix: Handle both tensor and scalar cases
+            if hasattr(not_pad_token, 'sum'):
+                kv_len = not_pad_token.sum().item() - 1
+            else:
+                kv_len = 1 if not_pad_token else 0
             n.update_kv(past_key_values, n_seq_len=n.len, subtree_idx=i, kv_len=kv_len)
 
             reward_score = reward_fn(n)
@@ -579,9 +712,41 @@ def expand(node, generate_fn, reward_fn, inference_config) -> Set[SeqNode]:
 
 
 def reward(node: SeqNode, model, reward_model, inference_config):
-    inputs = model.tokenizer.batch_decode(node.seq, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    score = reward_model.score(inputs, inference_config)
-    return score
+    if reward_model is None:
+        return [[0.2]]
+    else:
+        # Decode tensor to list of strings
+        # Work with a copy to avoid modifying the original node.seq
+        seq_to_decode = node.seq
+        
+        # Handle different input types more robustly
+        if isinstance(seq_to_decode, list):
+            # If it's a list, convert to tensor
+            if len(seq_to_decode) > 0 and isinstance(seq_to_decode[0], list):
+                # Handle nested lists (list of lists)
+                seq_to_decode = torch.tensor(seq_to_decode, device=next(model.parameters()).device)
+            else:
+                # Handle simple list
+                seq_to_decode = torch.tensor([seq_to_decode], device=next(model.parameters()).device)
+        elif not isinstance(seq_to_decode, torch.Tensor):
+            # Convert other types to tensor
+            seq_to_decode = torch.tensor([seq_to_decode], device=next(model.parameters()).device)
+        else:
+            # If it's already a tensor, make a copy to avoid modifying the original
+            seq_to_decode = seq_to_decode.clone()
+        
+        # Ensure proper shape for batch_decode (should be 2D: [batch_size, seq_length])
+        if seq_to_decode.dim() == 1:
+            seq_to_decode = seq_to_decode.unsqueeze(0)
+        elif seq_to_decode.dim() == 0:
+            seq_to_decode = seq_to_decode.unsqueeze(0).unsqueeze(0)
+        
+        # Ensure it's the right dtype (integer tokens)
+        if seq_to_decode.dtype != torch.long:
+            seq_to_decode = seq_to_decode.long()
+        
+        inputs = model.tokenizer.batch_decode(seq_to_decode, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return reward_model.score(inputs, inference_config)
 
 def terminated(node: SeqNode, inputs, inference_config) -> bool:
     generation_config = inference_config.llm_config
@@ -593,7 +758,7 @@ def terminated(node: SeqNode, inputs, inference_config) -> bool:
 
 global model
 
-def dpts_generate_cot(self, inputs, inference_config):
+def dpts_generate_cot(self, inputs, inference_config, embedding_model=None):
     generation_config = inference_config.llm_config
     config = inference_config.config
     global model
@@ -609,17 +774,30 @@ def dpts_generate_cot(self, inputs, inference_config):
         )
     reward_fn = partial(reward, model=self.generation_model, reward_model=self.reward_model, inference_config=inference_config)
     terminated_fn = partial(terminated, inputs=inputs, inference_config=inference_config)
-    expand_fn = partial(expand, generate_fn=generate_fn, reward_fn=reward_fn, inference_config=inference_config)
+    # Get tokenizer for clustering
+    tokenizer = getattr(self.generation_model, 'tokenizer', None)
+    # Create a wrapper function that can access the searcher
+    def expand_with_searcher(node):
+        return expand(node, generate_fn=generate_fn, reward_fn=reward_fn, inference_config=inference_config, 
+                     embedding_model=embedding_model, tokenizer=tokenizer, searcher=expand_with_searcher.searcher)
+    
     importance_fn = partial(self.importance, inference_config=inference_config)
     
-    dpts_searcher = CoT_DPTS_Searcher(config.max_rollout, config.max_step_time, expand_fn, reward_fn, terminated_fn, \
+    dpts_searcher = CoT_DPTS_Searcher(config.max_rollout, config.max_step_time, expand_with_searcher, reward_fn, terminated_fn, \
                                         importance_fn=importance_fn, inference_config=inference_config, generation_config=generation_config)
+    
+    # Set the searcher reference after creation
+    expand_with_searcher.searcher = dpts_searcher
 
     try:
         paths, scores = dpts_searcher.process(inputs)
     except torch.cuda.OutOfMemoryError:
         paths, scores = dpts_searcher.finalize()
 
+    # Get clustering metrics before deleting the searcher and store in model
+    clustering_metrics = dpts_searcher.get_clustering_metrics()
+    self._last_clustering_metrics = clustering_metrics
+    
     del dpts_searcher
     import gc
     gc.collect()

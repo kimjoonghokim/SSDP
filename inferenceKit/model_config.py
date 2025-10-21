@@ -1,5 +1,6 @@
 from .models import *
 from . import *
+from .models.embedding import *
 from functools import partial
 
 ########## llm model
@@ -21,6 +22,15 @@ supported_Reward_LLM = {
     'mistral_prm-7b': (MistralPRM, 'peiyi9979/math-shepherd-mistral-7b-prm')
 }
 
+######### embedding model
+
+supported_Embedding_Model = {
+    'sentence-transformers': (SentenceTransformerEmbedding, 'sentence-transformers/all-MiniLM-L6-v2'),
+    'all-mpnet-base-v2': (SentenceTransformerEmbedding, 'sentence-transformers/all-mpnet-base-v2'),
+    'all-distilroberta-v1': (SentenceTransformerEmbedding, 'sentence-transformers/all-distilroberta-v1'),
+    'paraphrase-multilingual-mpnet-base-v2': (SentenceTransformerEmbedding, 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'),
+}
+
 def create_llm(model_name, model_path=None, vllm=False):
     llm_class, default_path = supported_SFT_LLM[model_name]
     model_path = model_path or default_path
@@ -32,3 +42,12 @@ def create_prm(model_name, model_path=None):
     llm_class, default_path = supported_Reward_LLM[model_name]
     model_path = model_path or default_path
     return llm_class, model_path
+
+def create_embedding_model(model_name, model_path=None):
+    """Create embedding model instance."""
+    if model_name not in supported_Embedding_Model:
+        raise ValueError(f"Unsupported embedding model: {model_name}. Supported models: {list(supported_Embedding_Model.keys())}")
+    
+    embedding_class, default_path = supported_Embedding_Model[model_name]
+    model_path = model_path or default_path
+    return embedding_class, model_path

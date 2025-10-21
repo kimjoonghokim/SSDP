@@ -9,6 +9,7 @@ from transformers.generation import GenerationConfig
 
 from .llm import BaseLargeLanguageModel
 from .prm import BaseProcessRewardModel
+from .embedding import BaseEmbeddingModel
 from .generation import *
 from ..utils import InferenceConfig, update_single_config
 from .generation.cot import _agg_prm_min_max, _agg_prm_last_max,_agg_majority_vote,_agg_orm_vote,_agg_prm_min_vote,_agg_prm_last_vote, _extract_answer
@@ -35,7 +36,8 @@ class BaseInferenceModel(nn.Module):
             self, 
             generation_model: BaseLargeLanguageModel, 
             reward_model: Optional[BaseProcessRewardModel] = None, 
-            inference_config: Optional[InferenceConfig] = None, 
+            inference_config: Optional[InferenceConfig] = None,
+            embedding_model: Optional[BaseEmbeddingModel] = None,
             **kwargs,
         ):
         super().__init__()
@@ -43,6 +45,7 @@ class BaseInferenceModel(nn.Module):
         
         self.generation_model = generation_model
         self.reward_model = reward_model
+        self.embedding_model = embedding_model
         
         self.base_config = None
         self.inference_config = self._default_config(self.base_config)
@@ -63,6 +66,7 @@ class BaseInferenceModel(nn.Module):
         cots, scores = self.generate_cot(inputs, inference_config)
         cot_str_list, ans_list = self.post_process(cots, inference_config)
         response = self.vote_cot(cot_str_list, ans_list, scores, inference_config)
+        
         return response
         
     def generate_step(
@@ -90,11 +94,19 @@ class BaseInferenceModel(nn.Module):
             return self.generate_step(inputs, inference_config=inference_config)
         elif config.cot_method in COT_GENERATION_METHOD.keys():
             cot_generation_method = COT_GENERATION_METHOD[config.cot_method]
-            return cot_generation_method(self, inputs, inference_config)
+            result = cot_generation_method(self, inputs, inference_config)
+            if isinstance(result, tuple) and len(result) == 3:
+                return result[0], result[1]  # Return only paths and scores
+            else:
+                return result
         elif config.cot_method in PRM_COT_GENERATION_METHOD.keys():
             assert self.reward_model != None, "Cot method {config.cot_method} need reward model!"
             prm_cot_generation_method = PRM_COT_GENERATION_METHOD[config.cot_method]
-            return prm_cot_generation_method(self, inputs, inference_config)
+            result = prm_cot_generation_method(self, inputs, inference_config, embedding_model=self.embedding_model)
+            if isinstance(result, tuple) and len(result) == 3:
+                return result[0], result[1]  # Return only paths and scores
+            else:
+                return result
         else:
             raise NotImplementedError(f"Not implemention of cot method {config.cot_method} !!!")
 
@@ -119,8 +131,8 @@ class BaseInferenceModel(nn.Module):
     
 
 class DefaultInferenceModel(BaseInferenceModel):
-    def __init__(self, generation_model, reward_model = None, inference_config = None, **kwargs):
-        super().__init__(generation_model, reward_model, inference_config, **kwargs)
+    def __init__(self, generation_model, reward_model = None, inference_config = None, embedding_model = None, **kwargs):
+        super().__init__(generation_model, reward_model, inference_config, embedding_model, **kwargs)
         
         update_single_config(self.inference_config.config, copy=False, **kwargs)
 
@@ -172,6 +184,16 @@ Avoid skipping steps, and ensure that the final answer is clearly stated at the 
         answer_list = []
         
         for i in inputs:
+            # Ensure input is a proper tensor for batch_decode
+            if isinstance(i, list):
+                i = torch.tensor(i, device=next(self.generation_model.parameters()).device)
+            elif not isinstance(i, torch.Tensor):
+                i = torch.tensor([i], device=next(self.generation_model.parameters()).device)
+            
+            # Ensure proper shape for batch_decode (should be 2D: [batch_size, seq_length])
+            if i.dim() == 1:
+                i = i.unsqueeze(0)
+                
             response = self.generation_model.tokenizer.batch_decode(
                 i, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )[0]
@@ -205,10 +227,13 @@ Avoid skipping steps, and ensure that the final answer is clearly stated at the 
             raise NotImplementedError(f"Not implemention of voting method {voting_method} !!!")
         return results
     
+    def importance(self, node, inference_config):
+        return 1.0
+    
 
 class VLLMInferenceModel(BaseInferenceModel):
-    def __init__(self, generation_model, reward_model = None, inference_config = None, **kwargs):
-        super().__init__(generation_model, reward_model, inference_config, **kwargs)
+    def __init__(self, generation_model, reward_model = None, inference_config = None, embedding_model = None, **kwargs):
+        super().__init__(generation_model, reward_model, inference_config, embedding_model, **kwargs)
         
         update_single_config(self.inference_config.config, copy=False, **kwargs)
 
