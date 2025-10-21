@@ -308,8 +308,15 @@ pip install -r requirements.txt
 
 ## 📄 License
 
-Please check the LICENSE file in the repository for licensing information.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
+The Apache License 2.0 provides:
+- ✅ **Permissive licensing** - Allows commercial and non-commercial use
+- ✅ **Patent protection** - Explicit patent grant from contributors
+- ✅ **Attribution required** - Must include copyright notice
+- ✅ **Modification allowed** - Can create derivative works
+- ✅ **Distribution allowed** - Can redistribute with or without changes
+  
 ---
 
 ## 🙏 **Acknowledgments**
