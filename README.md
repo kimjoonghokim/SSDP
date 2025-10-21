@@ -24,7 +24,6 @@ This implementation is built on top of the [**Dynamic Parallel Tree Search (DPTS
 - **Multi-GPU Support**: Efficient distributed inference across multiple GPUs
 - **Flexible Configuration**: Easy-to-use JSON configuration system
 - **Multiple Datasets**: Support for GSM8K, MATH, and other reasoning benchmarks
-- **VLLM Integration**: Optional VLLM backend for faster inference
 
 ## 📋 Table of Contents
 
